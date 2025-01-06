@@ -58,7 +58,7 @@ Detection_Extraction<- function(sqldb, sp.list) {
   alltag<- tbl(sqldb, "alltags")
   tags.detect<-alltag %>%
     filter(tagProjID == 213 & motusTagID %in% tag.list & speciesID %in% sp.list) %>%
-    select(hitID, runID, batchID, ts, sig, port, noise, freqsd, motusTagID, 
+    select(runID, ts, sig, port, noise, freqsd, motusTagID, 
            ambigID, runLen, tagProjID, tagDeployID, tagDeployStart, tagDeployEnd, 
            tagDepLat, tagDepLon, deviceID, recvDeployID, recv,
            speciesID, markerNumber, mfgID, motusFilter, antBearing, antType, antHeight) %>%
