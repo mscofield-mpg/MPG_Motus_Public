@@ -17,144 +17,101 @@ sp.list<-c(7720)
 Detection_Extraction_and_Filter <- function(sqldb, sp.list) {
   start_time <- Sys.time()
   
-  # Tag metadata
-  tagmet <- tbl(sqldb, "tagDeps")
-  tags.meta <- tagmet %>%
-    select(deployID, tagID, projectID, tsStart, tsEnd, deferSec, speciesID, markerNumber, latitude, longitude, fullID, comments) %>%
-    filter(projectID == 213) %>%
-    filter(speciesID %in% sp.list) %>%
-    collect() %>%
-    as.data.frame() %>%
-    mutate(tsStart = as_datetime(tsStart, tz = "UTC", origin = "1970-01-01"),
-           tsEnd = as_datetime(tsEnd, tz = "UTC", origin = "1970-01-01")) %>%
-    distinct() %>%
-    filter(!is.na(longitude)) %>%
-    group_by(tagID) %>%
-    mutate(n = n()) %>%
-    ungroup()
+  # Load and process tag metadata
+  tags.meta <- as.data.table(
+    tbl(sqldb, "tagDeps") %>%
+      select(deployID, tagID, projectID, tsStart, tsEnd, deferSec, speciesID, 
+             markerNumber, latitude, longitude, fullID, comments) %>%
+      filter(projectID == 213, speciesID %in% sp.list) %>%
+      collect()
+  )
+  tags.meta <- tags.meta[
+    !is.na(longitude),
+    .(tagID, tsStart = as_datetime(tsStart, tz = "UTC", origin = "1970-01-01"),
+      tsEnd = as_datetime(tsEnd, tz = "UTC", origin = "1970-01-01"), speciesID)
+  ][, .SD[!duplicated(tagID)], by = tagID]
   
   # Ambiguous tags
-  allambigs <- tbl(sqldb, "allambigs")
-  ambig <- allambigs %>%
-    collect() %>%
-    as.data.frame()
-  
-  tags.ambigs <- ambig %>%
-    group_by(ambigID) %>%
-    mutate(inds = ifelse(any(motusTagID %in% tags.meta$tagID), "yes", "no")) %>%
-    filter(inds == "yes") %>%
-    ungroup() %>%
-    rename(tagID = motusTagID)
-  
-  # Tag list
-  tag.list <- tags.meta %>%
-    select(tagID) %>%
-    bind_rows(., tags.ambigs %>% select(tagID)) %>%
-    distinct() %>%
-    pull()
+  tags.ambigs <- as.data.table(
+    tbl(sqldb, "allambigs") %>% collect()
+  )[motusTagID %in% tags.meta$tagID, .(ambigID, tagID = motusTagID)]
   
   # Detection extraction
-  alltag <- tbl(sqldb, "alltags")
-  tags.detect <- alltag %>%
-    filter(tagProjID == 213 & motusTagID %in% tag.list & speciesID %in% sp.list) %>%
-    select(ts, sig, port, noise, freqsd, motusTagID, ambigID, runLen, tagProjID, 
-           tagDeployID, tagDeployStart, tagDeployEnd, tagDepLat, tagDepLon, deviceID, 
-           recvDeployID, recv, speciesID, markerNumber, mfgID, motusFilter, 
-           antBearing, antType, antHeight) %>%  # Removed hitID, batchID, runID
-    collect() %>%
-    as.data.frame() %>%
-    mutate(ts = as_datetime(ts),
-           tagDeployStart = as_datetime(tagDeployStart),
-           tagDeployEnd = as_datetime(tagDeployEnd)) %>%
-    distinct()
+  tags.detect <- as.data.table(
+    tbl(sqldb, "alltags") %>%
+      filter(tagProjID == 213, motusTagID %in% c(tags.meta$tagID, tags.ambigs$tagID), 
+             speciesID %in% sp.list) %>%
+      select(runID, ts, sig, port, noise, freqsd, motusTagID, 
+             ambigID, runLen, tagDeployID, tagDeployStart, 
+             tagDeployEnd, tagDepLat, tagDepLon, deviceID, recvDeployID, recv,
+             speciesID, mfgID, motusFilter, antBearing, antType, 
+             antHeight) %>%
+      collect()
+  )
+  tags.detect <- tags.detect[
+    , `:=`(ts = as_datetime(ts), 
+           tagDeployStart = as_datetime(tagDeployStart), 
+           tagDeployEnd = as_datetime(tagDeployEnd))
+  ]
   
   # Receiver metadata
-  recvmet <- tbl(sqldb, "recvDeps")
-  recv.meta <- recvmet %>%
-    collect() %>%
-    as.data.frame() %>%
-    mutate(tsStart = as_datetime(tsStart),
-           tsEnd = as_datetime(tsEnd))
+  recv.meta <- as.data.table(
+    tbl(sqldb, "recvDeps") %>% collect()
+  )[!is.na(longitude), .(recvDeployID = deployID, recvProjectID = projectID, 
+                         tsStart = as_datetime(tsStart), tsEnd = as_datetime(tsEnd),
+                         longitude, latitude)]
   
-  recv.meta <- recv.meta %>%
-    rename(recvDeployID = deployID, recvProjectID = projectID) %>%
-    distinct() %>%
-    filter(!is.na(longitude)) %>%
-    group_by(deviceID) %>%
-    mutate(n = n()) %>%
-    ungroup()
+  # Join receiver metadata
+  recvs <- tags.detect[
+    !is.na(recvDeployID),
+    .(recv, recvDeployID)
+  ][unique(recv.meta), on = "recvDeployID"]
   
-  # Join tables
-  recvs <- tags.detect %>%
-    select(receiverID = recv, recvDeployID) %>%
-    filter(!is.na(recvDeployID)) %>% 
-    distinct() %>%
-    left_join(., recv.meta) %>%
-    select(receiverID, recvDeployID, recvProjectID, stationName, 
-           latitude, longitude, receiverType, tsStart, tsEnd, isMobile) %>%
-    filter(!is.na(longitude))
-  
-  tags.detect <- left_join(tags.detect, recvs %>%
-                             select(recv = receiverID, recvDeployID, receiverType, 
-                                    recvName = stationName, recvDeployLat = latitude, recvDeployLon = longitude,
-                                    isMobile, recvProjID = recvProjectID) %>%
-                             distinct())
-  
-  # Preliminary filters
-  tags.detect <- tags.detect %>%
-    mutate(date = as.Date(ts), 
-           year = as.numeric(format(ts, '%Y')),
-           month = as.numeric(format(ts, '%m')),
-           motusFilter = ifelse(freqsd > 0.1, 0, motusFilter)) %>%
-    filter(ts >= tagDeployStart & ts <= tagDeployEnd,
-           !is.na(recvDeployLat)) %>%
-    group_by(motusTagID) %>%
-    mutate(af = sum(motusFilter)) %>%
-    filter(af > 0) %>%
-    ungroup() %>%
-    select(-af)
+  tags.detect <- tags.detect[
+    recvs,
+    on = .(recv, recvDeployID),
+    `:=`(recvLat = i.latitude, recvLon = i.longitude, recvType = i.recvType)
+  ][ts >= tagDeployStart & ts <= tagDeployEnd & !is.na(recvLat)]
   
   # Filter detections
-  tags.detpro <- tags.detect %>%
-    group_by(date, recvName, motusTagID) %>%
-    mutate(n = n(),
-           ntrue = sum(motusFilter),
-           ptrue = ntrue / n) %>%
-    ungroup()
+  tags.detect <- tags.detect[
+    freqsd <= 0.1, motusFilter := fifelse(motusFilter > 0, motusFilter, 0)
+  ][, af := sum(motusFilter), by = motusTagID][af > 0]
   
-  tags.filt <- tags.detpro %>%
-    mutate(ftemp = ifelse(ptrue > 0.30, 1, 0),
-           motusFilter = ftemp) %>%
-    filter(ftemp == 1)
+  # Secondary filtering
+  tags.detect <- tags.detect[
+    , `:=`(n = .N, ntrue = sum(motusFilter), ptrue = ntrue / .N), 
+    by = .(date(ts), recv, motusTagID)
+  ][ptrue > 0.30]
   
-  tags.filt.list <- unique(tags.filt$motusTagID)
+  tags.filtered <- tags.detect[
+    , `:=`(ftemp = 1, motusFilter = 1)
+  ]
   
-  transit.check <- tags.filt %>%
-    do(add_deploy_loc(.)) %>%
-    do(site_transit_min(.))
+  # Transit check
+  tags.filtered <- add_deploy_loc(tags.filtered)
+  transit.check <- site_transit_min(tags.filtered)
+  transit.suspect <- transit.check[suspect.transit == "suspect"]
   
-  transit.check.suspect <- transit.check %>%
-    filter(suspect.transit == "suspect")
+  # Connection states
+  tc <- transit.check[
+    , state := fifelse(dist.min == 0 | rate >= 5, "connected", "not_connected")
+  ][state == "connected", .(motusTagID, ts.x, lat.x, lon.x, lat.y, lon.y)]
   
-  tc <- transit.check %>%
-    mutate(state = ifelse(dist.min == 0 | rate >= 5, "connected", "not_connected")) %>%
-    filter(state == "connected") %>%
-    select(motusTagID, ts.x, lat.x, lon.x, lat.y, lon.y)
-  
-  end_time <- Sys.time()
-  elapsed_time <- as.numeric(difftime(end_time, start_time, units = "mins"))
-  
+  # Outputs
+  elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
   cat("Elapsed Time: ", format(round(elapsed_time, 2), nsmall = 2), " minutes\n")
   
-  return(list(tags.detect = tags.detect, 
-              tags.meta = tags.meta, 
-              tags.filtered = tags.filt,
-              tags.filt.list = tags.filt.list, 
-              transit.check.suspect = transit.check.suspect, 
-              connections = tc))
+  return(list(
+    tags.detect = tags.detect,
+    tags.filtered = tags.filtered,
+    tags.meta = tags.meta,
+    transit.suspect = transit.suspect,
+    connections = tc
+  ))
 }
 
-# Using the function
+#Run function
 Result <- Detection_Extraction_and_Filter(sqldb, sp.list)
 
 # Save outputs to CSV
